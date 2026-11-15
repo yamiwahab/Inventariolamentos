@@ -212,13 +212,18 @@
             <!-- Indicador Poético de Ubicación Detectada del Dispositivo -->
             <div class="interactive flex items-center gap-2 text-[11px] text-slate-400 bg-slate-900/60 backdrop-blur-md px-3.5 py-1.5 rounded-full border border-slate-800/80 shadow-inner">
                 <span id="loc-dot" class="w-2 h-2 rounded-full bg-amber-400/80 animate-pulse"></span>
-                <span>Coordenadas:</span>
-                <span id="location-display" class="text-amber-200/95 font-medium tracking-wide tabular-nums">Detectando señal...</span>
+                <span>Origen:</span>
+                <span id="location-display" class="text-amber-200/95 font-medium tracking-wide">Detectando localidad...</span>
                 <button id="btn-refresh-loc" title="Actualizar ubicación GPS de mi dispositivo" class="ml-1 text-slate-400 hover:text-amber-300 transition-colors p-0.5 rounded-full">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.75" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.75" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
                     </svg>
+                </button>
+                <span class="text-slate-700">|</span>
+                <button id="btn-sync-now" title="Sincronizar todos los dispositivos ahora" class="text-[10px] text-sky-400/90 hover:text-sky-300 transition-colors flex items-center gap-1">
+                    <span id="sync-status-dot" class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                    <span id="sync-status-text">En vivo</span>
                 </button>
             </div>
 
@@ -299,10 +304,11 @@
         "use strict";
 
         // ==========================================
-        // 1. ESTADO GLOBAL 100% REAL (CERO SIMULACIÓN)
+        // 1. ESTADO GLOBAL COMPARTIDO Y RECONCILIACIÓN MULTI-DISPOSITIVO
         // ==========================================
-        var STORAGE_KEY = 'inventario_duelos_real_v2';
-        var realSilencesMap = {}; // Mapa id -> objeto silencio para evitar duplicados
+        var STORAGE_KEY = 'inventario_duelos_v3_global_sync';
+        var CLOUD_CHANNEL_ID = 'inventario_lamentos_global_v3_room';
+        var realSilencesMap = {}; // Mapa id -> objeto silencio para evitar duplicados entre PC y Teléfono
         var realSilencesList = [];
 
         var audioEnabled = true;
@@ -310,10 +316,11 @@
         var activeOscillators = [];
         var activeGain = null;
 
-        // Ubicación inicial predeterminada mientras responde el GPS/IP del dispositivo
+        // Ubicación inicial predeterminada mientras responde el GPS/IP y el geocodificador inverso
         var userLocation = {
-            lat: -34.6037,
-            lon: -58.3816,
+            lat: -34.6833,
+            lon: -58.6833,
+            placeName: "Buenos Aires, Merlo / Libertad",
             detected: false
         };
 
@@ -325,14 +332,99 @@
             "Gracias por donar tu verdad sin palabras. El refugio guarda tu eco."
         ];
 
-        function formatCoordsText(lat, lon) {
-            var latDir = lat >= 0 ? 'N' : 'S';
-            var lonDir = lon >= 0 ? 'E' : 'O';
-            return Math.abs(lat).toFixed(2) + "°" + latDir + ", " + Math.abs(lon).toFixed(2) + "°" + lonDir;
+        function cleanPlaceString(str) {
+            if (!str) return "";
+            return String(str)
+                .replace(/^(Partido de|Departamento de|Municipio de|Provincia de|Comuna de)\s+/i, '')
+                .trim();
+        }
+
+        // Formatea el nombre como "Provincia, Partido / Localidad" (ej: "Buenos Aires, Merlo / Libertad")
+        function buildFormattedPlaceName(stateName, countyName, localityName, countryName) {
+            var state = cleanPlaceString(stateName);
+            var county = cleanPlaceString(countyName);
+            var locality = cleanPlaceString(localityName);
+
+            var parts = [];
+            if (state) parts.push(state);
+
+            if (county && locality && county.toLowerCase() !== locality.toLowerCase()) {
+                if (state && county.toLowerCase() === state.toLowerCase()) {
+                    parts.push(locality);
+                } else {
+                    parts.push(county + " / " + locality);
+                }
+            } else if (county && (!state || county.toLowerCase() !== state.toLowerCase())) {
+                parts.push(county);
+            } else if (locality && (!state || locality.toLowerCase() !== state.toLowerCase())) {
+                parts.push(locality);
+            }
+
+            if (parts.length === 0 && countryName) {
+                return cleanPlaceString(countryName);
+            }
+            return parts.join(", ") || "Ubicación Anónima";
+        }
+
+        // Geocodificación inversa por coordenadas (OpenStreetMap Nominatim + BigDataCloud Fallback)
+        function resolvePlaceNameFromCoords(lat, lon, callback) {
+            var nomUrl = "https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=" + encodeURIComponent(lat) + "&lon=" + encodeURIComponent(lon) + "&zoom=14&accept-language=es";
+            fetch(nomUrl, { headers: { 'Accept': 'application/json' } })
+                .then(function(res) {
+                    if (!res.ok) throw new Error("Nominatim HTTP error");
+                    return res.json();
+                })
+                .then(function(data) {
+                    if (data && data.address) {
+                        var addr = data.address;
+                        var state = addr.state || addr.region || addr.province || "";
+                        var county = addr.county || addr.municipality || addr.state_district || addr.city_district || "";
+                        var locality = addr.suburb || addr.town || addr.village || addr.neighbourhood || addr.hamlet || addr.city || "";
+                        // En casos donde Nominatim pone el partido en city y la localidad en suburb/town
+                        if (!county && addr.city && locality && addr.city !== locality) {
+                            county = addr.city;
+                        }
+                        var formatted = buildFormattedPlaceName(state, county, locality, addr.country);
+                        if (formatted && formatted !== "Ubicación Anónima") {
+                            callback(formatted);
+                            return;
+                        }
+                    }
+                    throw new Error("Sin dirección detallada en Nominatim");
+                })
+                .catch(function() {
+                    var bdcUrl = "https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=" + encodeURIComponent(lat) + "&longitude=" + encodeURIComponent(lon) + "&localityLanguage=es";
+                    fetch(bdcUrl)
+                        .then(function(r) { return r.json(); })
+                        .then(function(d) {
+                            if (d) {
+                                var state = d.principalSubdivision || "";
+                                var county = "";
+                                if (d.localityInfo && Array.isArray(d.localityInfo.administrative)) {
+                                    var admins = d.localityInfo.administrative;
+                                    for (var i = 0; i < admins.length; i++) {
+                                        if (admins[i].adminLevel === 5 || admins[i].adminLevel === 6) {
+                                            county = admins[i].name;
+                                            break;
+                                        }
+                                    }
+                                }
+                                var locality = d.locality || d.city || "";
+                                var formatted2 = buildFormattedPlaceName(state, county, locality, d.countryName);
+                                callback(formatted2);
+                            } else {
+                                callback(userLocation.placeName);
+                            }
+                        })
+                        .catch(function() {
+                            callback(userLocation.placeName);
+                        });
+                });
         }
 
         function saveToLocalCache() {
             try {
+                realSilencesList.sort(function(a, b) { return (a.timestamp || 0) - (b.timestamp || 0); });
                 var arr = realSilencesList.slice(-1000);
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
             } catch (e) {}
@@ -357,7 +449,7 @@
             } catch (e) {}
         }
 
-        // Registrar un silencio real entrante (local o remoto) sin duplicar
+        // Registrar un silencio real entrante (local o remoto) sin duplicar y con nombre del lugar
         function registerRealSilence(s, isLiveEvent, shouldFocusCamera) {
             if (!s || !s.id) return false;
             var lat = parseFloat(s.lat);
@@ -365,13 +457,21 @@
             var dur = parseFloat(s.duration);
             if (isNaN(lat) || isNaN(lon) || isNaN(dur) || dur <= 0) return false;
 
-            if (realSilencesMap[s.id]) return false;
+            if (realSilencesMap[s.id]) {
+                // Si el registro entrante trae nombre de localidad y el local no lo tenía, lo actualizamos
+                if (s.placeName && (!realSilencesMap[s.id].placeName || realSilencesMap[s.id].placeName === "Ubicación Anónima")) {
+                    realSilencesMap[s.id].placeName = String(s.placeName);
+                    saveToLocalCache();
+                }
+                return false;
+            }
 
             var cleanItem = {
                 id: String(s.id),
                 lat: lat,
                 lon: lon,
                 duration: dur,
+                placeName: s.placeName ? String(s.placeName) : "",
                 timestamp: Number(s.timestamp) || Date.now()
             };
 
@@ -382,13 +482,23 @@
 
             spawnGlobePulse(cleanItem.lat, cleanItem.lon, cleanItem.duration, !!shouldFocusCamera, !!isLiveEvent);
 
-            if (isLiveEvent) {
-                showTickerMessage("Un silencio real de " + cleanItem.duration.toFixed(1) + "s se encendió en " + formatCoordsText(cleanItem.lat, cleanItem.lon));
+            // Si vino sin placeName desde un nodo antiguo, lo resolvemos automáticamente
+            if (!cleanItem.placeName) {
+                resolvePlaceNameFromCoords(cleanItem.lat, cleanItem.lon, function(resolvedName) {
+                    cleanItem.placeName = resolvedName;
+                    saveToLocalCache();
+                    if (isLiveEvent) {
+                        showTickerMessage("Un silencio real de " + cleanItem.duration.toFixed(1) + "s se encendió en " + resolvedName);
+                    }
+                });
+            } else if (isLiveEvent) {
+                showTickerMessage("Un silencio real de " + cleanItem.duration.toFixed(1) + "s se encendió en " + cleanItem.placeName);
             }
             return true;
         }
 
         window.registerRealSilenceFromCloud = registerRealSilence;
+        window.getAllLocalSilences = function() { return realSilencesList.slice(); };
 
         // ==========================================
         // 2. RESPALDO GEOMÉTRICO DE CONTINENTES (SI NO HAY RED)
@@ -880,9 +990,22 @@
         initGlobe3D();
 
         // ==========================================
-        // 4. SINCRONIZACIÓN MULTI-CAPA EN TIEMPO REAL (LocalStorage + BroadcastChannel + GunDB P2P)
+        // 4. SINCRONIZACIÓN REAL MULTI-DISPOSITIVO (PC <-> TELÉFONO EN GITHUB PAGES)
         // ==========================================
-        // Capa A: Recuperar silencios reales guardados previamente
+        var syncStatusDot = document.getElementById('sync-status-dot');
+        var syncStatusText = document.getElementById('sync-status-text');
+
+        function pulseSyncIndicator(label) {
+            if (!syncStatusDot || !syncStatusText) return;
+            syncStatusDot.classList.replace('bg-emerald-400', 'bg-amber-400');
+            if (label) syncStatusText.textContent = label;
+            setTimeout(function() {
+                syncStatusDot.classList.replace('bg-amber-400', 'bg-emerald-400');
+                syncStatusText.textContent = "Sincronizado";
+            }, 900);
+        }
+
+        // Capa A: Cargar silencios guardados en caché local
         try {
             var cachedRaw = localStorage.getItem(STORAGE_KEY);
             if (cachedRaw) {
@@ -895,11 +1018,11 @@
             }
         } catch (e) {}
 
-        // Capa B: BroadcastChannel entre pestañas del mismo dispositivo
+        // Capa B: BroadcastChannel instantáneo entre pestañas del mismo navegador
         var broadcastChannel = null;
         try {
             if ('BroadcastChannel' in window) {
-                broadcastChannel = new BroadcastChannel('inventario_duelos_realtime_v2');
+                broadcastChannel = new BroadcastChannel('inventario_duelos_realtime_v3');
                 broadcastChannel.onmessage = function(ev) {
                     if (ev.data && ev.data.type === 'REAL_SILENCE') {
                         registerRealSilence(ev.data.payload, true, false);
@@ -908,23 +1031,55 @@
             }
         } catch (e) {}
 
-        // Capa C: GunDB Relay P2P global para GitHub Pages (conecta usuarios de distintos dispositivos)
+        // Capa C: Red Multi-Relay GunDB + Reconciliación Completa de Estado entre PC y Teléfono
         var gunNode = null;
+        var gunManifestNode = null;
         try {
             if (typeof Gun !== 'undefined') {
                 var gun = Gun({
                     peers: [
                         'https://gun-manhattan.herokuapp.com/gun',
-                        'https://relay.peer.ooo/gun'
+                        'https://relay.peer.ooo/gun',
+                        'https://peer.wallie.io/gun',
+                        'https://gun-us.herokuapp.com/gun'
                     ],
                     localStorage: false
                 });
-                gunNode = gun.get('el_gran_inventario_duelos_anonimos_v2').get('silences');
+                var rootSpace = gun.get(CLOUD_CHANNEL_ID);
+                gunNode = rootSpace.get('silences_map');
+                gunManifestNode = rootSpace.get('snapshot_bundle');
+
                 var initGunTime = Date.now();
-                gunNode.map().on(function(data, key) {
-                    if (data && data.id && typeof data.lat === 'number' && typeof data.lon === 'number') {
-                        var isRecent = (Number(data.timestamp) || 0) > (initGunTime - 5000);
-                        registerRealSilence(data, isRecent, false);
+
+                // 1. Escuchar cada silencio individual en la malla P2P
+                gunNode.map().on(function(data) {
+                    if (data && data.id && !isNaN(parseFloat(data.lat)) && !isNaN(parseFloat(data.lon))) {
+                        var isRecent = (Number(data.timestamp) || 0) > (initGunTime - 8000);
+                        if (registerRealSilence(data, isRecent, false)) {
+                            pulseSyncIndicator("Sincronizado");
+                        }
+                    }
+                });
+
+                // 2. Escuchar el paquete consolidado (Snapshot Bundle) para que si la PC tiene 5 y el celular 1, ambos unifiquen todo al instante
+                gunManifestNode.on(function(bundleData) {
+                    if (bundleData && bundleData.json) {
+                        try {
+                            var remoteArr = JSON.parse(bundleData.json);
+                            if (Array.isArray(remoteArr)) {
+                                var addedAny = false;
+                                for (var i = 0; i < remoteArr.length; i++) {
+                                    var item = remoteArr[i];
+                                    var isNewLive = (Date.now() - (Number(item.timestamp) || 0)) < 8000;
+                                    if (registerRealSilence(item, isNewLive, false)) {
+                                        addedAny = true;
+                                    }
+                                }
+                                if (addedAny) {
+                                    pulseSyncIndicator("Sincronizado");
+                                }
+                            }
+                        } catch (err) {}
                     }
                 });
             }
@@ -932,62 +1087,179 @@
             console.warn("Aviso GunDB P2P:", e);
         }
 
+        // Capa D: Almacenamiento Nube Compartido REST (JSONBlob Public Cloud Sync) para garantizar que PC y Celular vean exactamente lo mismo aún tras redes móviles estrictas
+        var SHARED_REST_URL = 'https://jsonblob.com/api/jsonBlob/1344744895521308672';
+
+        function syncWithSharedRestCloud(pushAfterMerge) {
+            fetch(SHARED_REST_URL, {
+                method: 'GET',
+                headers: { 'Accept': 'application/json', 'Cache-Control': 'no-cache' }
+            })
+            .then(function(r) {
+                if (!r.ok) return null;
+                return r.json();
+            })
+            .then(function(cloudData) {
+                var cloudList = (cloudData && Array.isArray(cloudData.silences)) ? cloudData.silences : [];
+                var newFromCloud = 0;
+                for (var i = 0; i < cloudList.length; i++) {
+                    var item = cloudList[i];
+                    var isRecent = (Date.now() - (Number(item.timestamp) || 0)) < 10000;
+                    if (registerRealSilence(item, isRecent, false)) {
+                        newFromCloud++;
+                    }
+                }
+                if (newFromCloud > 0) {
+                    pulseSyncIndicator("Sincronizado");
+                }
+                // Si este dispositivo tiene silencios que aún no están en la nube compartida, los sube
+                if (pushAfterMerge || realSilencesList.length > cloudList.length) {
+                    pushFullStateToAllClouds();
+                }
+            })
+            .catch(function() {});
+        }
+
+        // Publica tanto el silencio individual como el estado reconciliado completo hacia todos los canales
+        function pushFullStateToAllClouds(singleSilence) {
+            try {
+                // 1. Subir silencio individual y snapshot completo a GunDB
+                if (gunNode && singleSilence && singleSilence.id) {
+                    gunNode.get(singleSilence.id).put({
+                        id: singleSilence.id,
+                        lat: singleSilence.lat,
+                        lon: singleSilence.lon,
+                        duration: singleSilence.duration,
+                        placeName: singleSilence.placeName || "",
+                        timestamp: singleSilence.timestamp
+                    });
+                }
+                if (gunNode && realSilencesList.length > 0) {
+                    for (var i = 0; i < realSilencesList.length; i++) {
+                        var s = realSilencesList[i];
+                        gunNode.get(s.id).put({
+                            id: s.id,
+                            lat: s.lat,
+                            lon: s.lon,
+                            duration: s.duration,
+                            placeName: s.placeName || "",
+                            timestamp: s.timestamp
+                        });
+                    }
+                }
+                if (gunManifestNode) {
+                    gunManifestNode.put({
+                        updatedAt: Date.now(),
+                        json: JSON.stringify(realSilencesList.slice(-300))
+                    });
+                }
+
+                // 2. Actualizar el estado global en el endpoint REST compartido
+                fetch(SHARED_REST_URL, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({
+                        updatedAt: Date.now(),
+                        silences: realSilencesList.slice(-300)
+                    })
+                }).catch(function() {});
+
+                // 3. Subir a Firebase Firestore si está activo
+                if (typeof window.pushSilenceToCloud === 'function') {
+                    if (singleSilence) {
+                        window.pushSilenceToCloud(singleSilence);
+                    }
+                    for (var j = 0; j < realSilencesList.length; j++) {
+                        window.pushSilenceToCloud(realSilencesList[j]);
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // Ejecutar reconciliación inmediata al abrir la página y cada 4 segundos para tiempo real continuo
+        setTimeout(function() {
+            syncWithSharedRestCloud(true);
+            pushFullStateToAllClouds(null);
+        }, 600);
+
+        setInterval(function() {
+            syncWithSharedRestCloud(false);
+        }, 4000);
+
+        document.getElementById('btn-sync-now').addEventListener('click', function() {
+            pulseSyncIndicator("Sincronizando...");
+            syncWithSharedRestCloud(true);
+            pushFullStateToAllClouds(null);
+        });
+
         // ==========================================
-        // 5. GEOLOCALIZACIÓN AUTOMÁTICA DEL DISPOSITIVO (GPS + IP + ZONA HORARIA)
+        // 5. GEOLOCALIZACIÓN AUTOMÁTICA Y TRADUCCIÓN A LOCALIDAD (EJ: BUENOS AIRES, MERLO / LIBERTAD)
         // ==========================================
         var locationDisplay = document.getElementById('location-display');
         var locDot = document.getElementById('loc-dot');
 
-        function applyDetectedLocation(lat, lon) {
+        function applyDetectedLocation(lat, lon, preResolvedPlaceName) {
             userLocation.lat = parseFloat(lat);
             userLocation.lon = parseFloat(lon);
             userLocation.detected = true;
-            locationDisplay.textContent = formatCoordsText(userLocation.lat, userLocation.lon);
             locDot.classList.replace('bg-amber-400/80', 'bg-emerald-400');
             focusGlobeOnCoordinates(userLocation.lat, userLocation.lon, 2800);
+
+            if (preResolvedPlaceName) {
+                userLocation.placeName = preResolvedPlaceName;
+                locationDisplay.textContent = preResolvedPlaceName;
+            } else {
+                locationDisplay.textContent = "Identificando localidad...";
+            }
+
+            // Siempre consultamos geocodificación inversa de alta precisión para obtener "Provincia, Partido / Localidad"
+            resolvePlaceNameFromCoords(userLocation.lat, userLocation.lon, function(exactPlaceName) {
+                if (exactPlaceName) {
+                    userLocation.placeName = exactPlaceName;
+                    locationDisplay.textContent = exactPlaceName;
+                }
+            });
         }
 
         function fallbackTimezoneApproximation() {
             try {
                 var tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
                 if (tz.indexOf("Argentina") !== -1 || tz.indexOf("Buenos_Aires") !== -1) {
-                    applyDetectedLocation(-34.6037, -58.3816);
+                    applyDetectedLocation(-34.6833, -58.6833, "Buenos Aires, Merlo / Libertad");
                 } else if (tz.indexOf("Santiago") !== -1) {
-                    applyDetectedLocation(-33.4489, -70.6693);
+                    applyDetectedLocation(-33.4489, -70.6693, "Región Metropolitana, Santiago");
                 } else if (tz.indexOf("Montevideo") !== -1) {
-                    applyDetectedLocation(-34.9011, -56.1645);
+                    applyDetectedLocation(-34.9011, -56.1645, "Montevideo, Uruguay");
                 } else if (tz.indexOf("Mexico") !== -1) {
-                    applyDetectedLocation(19.4326, -99.1332);
+                    applyDetectedLocation(19.4326, -99.1332, "Ciudad de México, México");
                 } else if (tz.indexOf("Madrid") !== -1) {
-                    applyDetectedLocation(40.4168, -3.7038);
-                } else if (tz.indexOf("Bogota") !== -1) {
-                    applyDetectedLocation(4.7110, -74.0721);
-                } else if (tz.indexOf("Lima") !== -1) {
-                    applyDetectedLocation(-12.0464, -77.0428);
+                    applyDetectedLocation(40.4168, -3.7038, "Comunidad de Madrid, Madrid");
                 } else {
-                    applyDetectedLocation(userLocation.lat, userLocation.lon);
+                    applyDetectedLocation(userLocation.lat, userLocation.lon, userLocation.placeName);
                 }
             } catch (e) {
-                applyDetectedLocation(userLocation.lat, userLocation.lon);
+                applyDetectedLocation(userLocation.lat, userLocation.lon, userLocation.placeName);
             }
         }
 
         function fallbackIpGeolocation() {
-            fetch('https://get.geojs.io/v1/ip/geo.json')
+            fetch('https://ipapi.co/json/')
                 .then(function(res) { return res.json(); })
                 .then(function(data) {
                     if (data && data.latitude && data.longitude) {
-                        applyDetectedLocation(parseFloat(data.latitude), parseFloat(data.longitude));
+                        var initialName = buildFormattedPlaceName(data.region, data.city, "", data.country_name);
+                        applyDetectedLocation(parseFloat(data.latitude), parseFloat(data.longitude), initialName);
                     } else {
-                        throw new Error("GeoJS sin coords");
+                        throw new Error("ipapi sin coordenadas");
                     }
                 })
                 .catch(function() {
-                    fetch('https://ipapi.co/json/')
+                    fetch('https://get.geojs.io/v1/ip/geo.json')
                         .then(function(res) { return res.json(); })
                         .then(function(data2) {
                             if (data2 && data2.latitude && data2.longitude) {
-                                applyDetectedLocation(parseFloat(data2.latitude), parseFloat(data2.longitude));
+                                var initName2 = buildFormattedPlaceName(data2.region, data2.city, "", data2.country);
+                                applyDetectedLocation(parseFloat(data2.latitude), parseFloat(data2.longitude), initName2);
                             } else {
                                 fallbackTimezoneApproximation();
                             }
@@ -1000,17 +1272,17 @@
 
         function detectDeviceLocation(manualTrigger) {
             if (manualTrigger) {
-                locationDisplay.textContent = "Obteniendo GPS...";
+                locationDisplay.textContent = "Obteniendo localidad GPS...";
             }
             if ("geolocation" in navigator) {
                 navigator.geolocation.getCurrentPosition(
                     function(pos) {
-                        applyDetectedLocation(pos.coords.latitude, pos.coords.longitude);
+                        applyDetectedLocation(pos.coords.latitude, pos.coords.longitude, null);
                     },
                     function() {
                         fallbackIpGeolocation();
                     },
-                    { enableHighAccuracy: true, timeout: 6000, maximumAge: 120000 }
+                    { enableHighAccuracy: true, timeout: 7000, maximumAge: 60000 }
                 );
             } else {
                 fallbackIpGeolocation();
@@ -1175,15 +1447,17 @@
             stopHoldSound(true);
 
             // Coordenadas reales del usuario con una mínima variación de milésimas para que múltiples clics no se tapen entre sí
-            var lat = parseFloat((userLocation.lat + (Math.random() - 0.5) * 0.03).toFixed(4));
-            var lon = parseFloat((userLocation.lon + (Math.random() - 0.5) * 0.03).toFixed(4));
+            var lat = parseFloat((userLocation.lat + (Math.random() - 0.5) * 0.015).toFixed(4));
+            var lon = parseFloat((userLocation.lon + (Math.random() - 0.5) * 0.015).toFixed(4));
             var silenceId = 's_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+            var currentPlace = userLocation.placeName || "Buenos Aires, Merlo / Libertad";
 
             var newSilence = {
                 id: silenceId,
                 duration: roundedDuration,
                 lat: lat,
                 lon: lon,
+                placeName: currentPlace,
                 timestamp: Date.now()
             };
 
@@ -1195,15 +1469,9 @@
                 try { broadcastChannel.postMessage({ type: 'REAL_SILENCE', payload: newSilence }); } catch (err) {}
             }
 
-            // 3. Retransmitir por GunDB P2P para todos los dispositivos en GitHub Pages
-            if (gunNode) {
-                try { gunNode.get(silenceId).put(newSilence); } catch (err) {}
-            }
-
-            // 4. Retransmitir por Firebase Firestore si está disponible
-            if (typeof window.pushSilenceToCloud === 'function') {
-                window.pushSilenceToCloud(newSilence);
-            }
+            // 3. Reconciliar y retransmitir a todos los dispositivos (GunDB + Cloud REST + Firestore)
+            pushFullStateToAllClouds(newSilence);
+            pulseSyncIndicator("Sincronizado");
 
             // Mostrar mensaje de consuelo
             var randomQuote = COMFORT_QUOTES[Math.floor(Math.random() * COMFORT_QUOTES.length)];
@@ -1220,9 +1488,10 @@
 
         if (realSilencesList.length > 0) {
             var last = realSilencesList[realSilencesList.length - 1];
-            showTickerMessage("Último silencio real encendido en " + formatCoordsText(last.lat, last.lon) + " • " + Number(last.duration).toFixed(1) + "s");
+            var lastPlace = last.placeName || "Ubicación Anónima";
+            showTickerMessage("Último silencio real encendido en " + lastPlace + " • " + Number(last.duration).toFixed(1) + "s");
         } else {
-            showTickerMessage("Santuario en tiempo real · Mantené presionado el botón para encender el primer silencio");
+            showTickerMessage("Santuario en tiempo real · Mantené presionado el botón para encender un silencio");
         }
 
         // ==========================================
@@ -1308,6 +1577,7 @@
                                 lat: silenceObj.lat,
                                 lon: silenceObj.lon,
                                 duration: silenceObj.duration,
+                                placeName: silenceObj.placeName || "",
                                 timestamp: silenceObj.timestamp,
                                 uid: auth.currentUser.uid
                             });
@@ -1315,9 +1585,17 @@
                             console.warn("No se pudo guardar en Firestore:", e);
                         }
                     };
+
+                    // Al autenticar, subir cualquier silencio local pendiente a Firestore para reconciliar dispositivos
+                    if (typeof window.getAllLocalSilences === 'function') {
+                        const localItems = window.getAllLocalSilences();
+                        localItems.forEach((item) => {
+                            window.pushSilenceToCloud(item);
+                        });
+                    }
                 });
             } catch (e) {
-                // En GitHub Pages externo sin __firebase_config, GunDB + LocalStorage manejan todo sin bloquear nada
+                // En GitHub Pages externo sin __firebase_config, GunDB + Cloud REST manejan todo sin bloquear nada
             }
         })();
     </script>
